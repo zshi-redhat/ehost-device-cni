@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -33,11 +34,16 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
+const (
+	netDirectory    = "/sys/class/net/"
+)
+
 type NetConf struct {
 	types.NetConf
 	Device     string `json:"device"`     // Device-Name, something like eth0 or can0 etc.
 	HWAddr     string `json:"hwaddr"`     // MAC Address of target network interface
 	KernelPath string `json:"kernelpath"` // Kernelpath of the device
+	DeviceID   string `json:"deviceID"`   // PCI address of the device
 }
 
 func init() {
@@ -47,10 +53,40 @@ func init() {
 	runtime.LockOSThread()
 }
 
+func getDeviceName(deviceID string) (string, error) {
+
+	netDevices, err := ioutil.ReadDir(netDirectory)
+	if err != nil {
+		return "", err
+	}
+	if len(netDevices) < 1 {
+		return "", fmt.Errorf("Error. No network device found in %s directory", netDirectory)
+	}
+	for _, dev := range netDevices {
+		deviceFilePath := filepath.Join(netDirectory, dev.Name())
+		pciinfo, err := os.Readlink(deviceFilePath)
+		if err != nil {
+			continue
+		}
+		if strings.Contains(pciinfo, deviceID) {
+			return dev.Name(), nil
+		}
+	}
+	return "", nil
+}
+
 func loadConf(bytes []byte) (*NetConf, error) {
 	n := &NetConf{}
 	if err := json.Unmarshal(bytes, n); err != nil {
 		return nil, fmt.Errorf("failed to load netconf: %v", err)
+	}
+
+	if n.DeviceID != "" {
+		deviceName, err := getDeviceName(n.DeviceID)
+		if err != nil {
+			return n, err
+		}
+		n.Device = deviceName
 	}
 	if n.Device == "" && n.HWAddr == "" && n.KernelPath == "" {
 		return nil, fmt.Errorf(`specify either "device", "hwaddr" or "kernelpath"`)
