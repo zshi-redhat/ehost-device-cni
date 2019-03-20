@@ -17,6 +17,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -114,38 +115,62 @@ func cmdAdd(args *skel.CmdArgs) error {
 	if err != nil {
 		return fmt.Errorf("failed to move link %v", err)
 	}
-	r, err := ipam.ExecAdd(cfg.IPAM.Type, args.StdinData)
-	if err != nil {
-		return fmt.Errorf("failed to set up IPAM plugin type %q: %v", cfg.IPAM.Type, err)
-	}
-	result, err := current.NewResultFromResult(r)
-	if err != nil {
-		return fmt.Errorf("IPAM plugin convert to New Result type failed")
-	}
-	if len(result.IPs) == 0 {
-		return fmt.Errorf("IPAM plugin returned missing IP config")
-	}
-	containerInterface := &current.Interface{}
-	containerInterface.Name = args.IfName
 
-	result.Interfaces = []*current.Interface{containerInterface}
-	for _, ipc := range result.IPs {
-		ipc.Interface = current.Int(0)
-	}
-	err = containerNs.Do(func(_ ns.NetNS) error {
-		return ipam.ConfigureIface(args.IfName, result)
-	})
-	if err != nil {
-		return fmt.Errorf("IPAM plugin returned configuring interface failed")
+	// run the IPAM plugin and get back the config to apply
+	if cfg.IPAM.Type != "" {
+		r, err := ipam.ExecAdd(cfg.IPAM.Type, args.StdinData)
+		if err != nil {
+			return err
+		}
+
+		// Invoke ipam del if err to avoid ip leak
+		defer func() {
+			if err != nil {
+				ipam.ExecDel(cfg.IPAM.Type, args.StdinData)
+			}
+		}()
+
+		// Convert whatever the IPAM result was into the current Result type
+		result, err := current.NewResultFromResult(r)
+		if err != nil {
+			return err
+		}
+
+		if len(result.IPs) == 0 {
+			return errors.New("IPAM plugin returned missing IP config")
+		}
+
+		result.Interfaces = []*current.Interface{{
+			Name:    contDev.Attrs().Name,
+			Mac:     contDev.Attrs().HardwareAddr.String(),
+			Sandbox: containerNs.Path(),
+		}}
+		for _, ipc := range result.IPs {
+			// All addresses apply to the container interface (move from host)
+			ipc.Interface = current.Int(0)
+		}
+
+		err = containerNs.Do(func(_ ns.NetNS) error {
+			if err := ipam.ConfigureIface(args.IfName, result); err != nil {
+				return err
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
 	}
 
 	return printLink(contDev, cfg.CNIVersion, containerNs)
 }
 
 func cmdDel(args *skel.CmdArgs) error {
-	_, err := loadConf(args.StdinData)
+	cfg, err := loadConf(args.StdinData)
 	if err != nil {
 		return err
+	}
+	if args.Netns == "" {
+		return nil
 	}
 	containerNs, err := ns.GetNS(args.Netns)
 	if err != nil {
@@ -155,6 +180,12 @@ func cmdDel(args *skel.CmdArgs) error {
 
 	if err := moveLinkOut(containerNs, args.IfName); err != nil {
 		return err
+	}
+
+	if cfg.IPAM.Type != "" {
+		if err := ipam.ExecDel(cfg.IPAM.Type, args.StdinData); err != nil {
+			return err
+		}
 	}
 
 	return nil
